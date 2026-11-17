@@ -531,6 +531,7 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
         replace_parameter(layer, "weight", weight.contiguous())
         replace_parameter(layer, "weight_scale", weight_scale)
         layer.weight_preshuffled = None
+        layer.weight_scale_cols = None
         if block_scale is None or not self.flydsl_enabled:
             return
         why = self._flydsl_fallback(layer)
@@ -547,6 +548,25 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
                 replace_parameter(layer, "weight", shuffled)
                 shuffled = layer.weight.data
             layer.weight_preshuffled = shuffled
+            self._prepare_gluon_gemm(layer)
+
+    @staticmethod
+    def _prepare_gluon_gemm(layer: torch.nn.Module) -> None:
+        """Keeps the per-column weight scales the Gluon GEMM reads, for the
+        shapes it is tuned to beat AITER's GEMM on."""
+        from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
+            gluon_gemm_config,
+            weight_scale_cols,
+        )
+
+        n, k = layer.weight.shape
+        batched = getattr(layer, "bmm_batch_size", None) is not None
+        if batched or gluon_gemm_config(n, k) is None:
+            return
+        logger.info_once(
+            "MXFP8 32x32 block-scaled linear [%d, %d]: Gluon GEMM at large M", n, k
+        )
+        layer.weight_scale_cols = weight_scale_cols(layer.weight_scale.data, n)
 
     def input_quant_key(self) -> QuantKey:
         # Row-major [M, K // 32] E8M0 scales, unlike FlashInfer's swizzled ones
@@ -596,6 +616,7 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
                     layer.weight_scale,
                     out_dtype,
                     getattr(layer, "weight_preshuffled", None),
+                    getattr(layer, "weight_scale_cols", None),
                 )
             else:
                 # The op quantizes the activation itself: at tiny M (the
@@ -612,6 +633,7 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
                     layer.weight_scale,
                     out_dtype,
                     getattr(layer, "weight_preshuffled", None),
+                    getattr(layer, "weight_scale_cols", None),
                 )
         elif qa is not None:
             out = _mxfp8_dot_scaled_gemm(

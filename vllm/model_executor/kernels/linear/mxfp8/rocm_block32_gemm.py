@@ -897,6 +897,24 @@ def _aiter_gemm(x, x_scale, weight_preshuffled, weight_scale, out) -> None:
         )
 
 
+def _preshuffled_gemm(
+    x, x_scale, weight_preshuffled, weight_scale, weight_scale_cols, out
+) -> None:
+    """AITER's FlyDSL GEMM, or the Gluon one where it is tuned to be faster."""
+    if weight_scale_cols is not None and x.is_contiguous() and x_scale.is_contiguous():
+        from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
+            gluon_gemm_enabled,
+            rocm_mxfp8_gluon_gemm,
+        )
+
+        if gluon_gemm_enabled(x.shape[0], *weight_preshuffled.shape):
+            rocm_mxfp8_gluon_gemm(
+                x, x_scale, weight_preshuffled, weight_scale_cols, out
+            )
+            return
+    _aiter_gemm(x, x_scale, weight_preshuffled, weight_scale, out)
+
+
 def _rocm_mxfp8_block32_gemm_impl(
     x: torch.Tensor,
     x_scale: torch.Tensor,
@@ -904,11 +922,14 @@ def _rocm_mxfp8_block32_gemm_impl(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
     weight_preshuffled: torch.Tensor | None = None,
+    weight_scale_cols: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M, K = x.shape
     out = torch.empty((M, weight.shape[0]), dtype=out_dtype, device=x.device)
     if M > 0 and weight_preshuffled is not None:
-        _aiter_gemm(x, x_scale, weight_preshuffled, weight_scale, out)
+        _preshuffled_gemm(
+            x, x_scale, weight_preshuffled, weight_scale, weight_scale_cols, out
+        )
     elif M > 0:
         _launch(x, x_scale, weight, weight_scale, out, _config(M, weight.shape[0], K))
     return out
@@ -921,6 +942,7 @@ def _rocm_mxfp8_block32_gemm_fake(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
     weight_preshuffled: torch.Tensor | None = None,
+    weight_scale_cols: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=out_dtype)
 
@@ -941,6 +963,7 @@ def rocm_mxfp8_block32_gemm(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
     weight_preshuffled: torch.Tensor | None = None,
+    weight_scale_cols: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`x @ weight.T` for MXFP8 `x` and a 32x32 block-scaled MXFP8 weight.
 
@@ -952,13 +975,22 @@ def rocm_mxfp8_block32_gemm(
         out_dtype: Output dtype.
         weight_preshuffled: `weight` (16, 16)-preshuffled, possibly `weight`
             itself; given, AITER's tuned FlyDSL GEMMs serve every M.
+        weight_scale_cols: [K / 32, N] uint8 `weight_scale` per column (see
+            `rocm_gluon_gemm.weight_scale_cols`); given with
+            `weight_preshuffled`, the Gluon GEMM serves the M it is tuned for.
 
     Returns:
         The [M, N] product.
 
     """
     return torch.ops.vllm.rocm_mxfp8_block32_gemm(
-        x, x_scale, weight, weight_scale, out_dtype, weight_preshuffled
+        x,
+        x_scale,
+        weight,
+        weight_scale,
+        out_dtype,
+        weight_preshuffled,
+        weight_scale_cols,
     )
 
 
@@ -981,6 +1013,7 @@ def _rocm_mxfp8_block32_gemm_quant_impl(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
     weight_preshuffled: torch.Tensor | None = None,
+    weight_scale_cols: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`x @ weight.T` for raw bf16/fp16 `x` and a 32x32 block-scaled
     MXFP8 weight, quantizing `x` inside the GEMM at tiny M.
@@ -1001,7 +1034,9 @@ def _rocm_mxfp8_block32_gemm_quant_impl(
         return out
     if weight_preshuffled is not None:
         x_q, x_scale = mxfp8_e4m3_quantize(x)
-        _aiter_gemm(x_q, x_scale, weight_preshuffled, weight_scale, out)
+        _preshuffled_gemm(
+            x_q, x_scale, weight_preshuffled, weight_scale, weight_scale_cols, out
+        )
         return out
     cfg = _config(M, weight.shape[0], K)
     eligible = (
@@ -1049,6 +1084,7 @@ def _rocm_mxfp8_block32_gemm_quant_fake(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
     weight_preshuffled: torch.Tensor | None = None,
+    weight_scale_cols: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=out_dtype)
 
@@ -1068,13 +1104,14 @@ def rocm_mxfp8_block32_gemm_quant(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
     weight_preshuffled: torch.Tensor | None = None,
+    weight_scale_cols: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`x @ weight.T` for a raw bf16/fp16 `x` [M, K] and a 32x32
     block-scaled MXFP8 `weight` [N, K] with `weight_scale`
     [N / 32, K / 32]. Tiny-M batches quantize inside the packed GEMM (see
-    `_rocm_mxfp8_block32_gemm_quant_impl`). `weight_preshuffled` as in
-    `rocm_mxfp8_block32_gemm`.
+    `_rocm_mxfp8_block32_gemm_quant_impl`). `weight_preshuffled` and
+    `weight_scale_cols` as in `rocm_mxfp8_block32_gemm`.
     """
     return torch.ops.vllm.rocm_mxfp8_block32_gemm_quant(
-        x, weight, weight_scale, out_dtype, weight_preshuffled
+        x, weight, weight_scale, out_dtype, weight_preshuffled, weight_scale_cols
     )

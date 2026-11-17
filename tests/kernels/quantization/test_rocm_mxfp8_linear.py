@@ -965,6 +965,45 @@ def test_rocm_mxfp8_linear_flydsl_matches_triton(flydsl, n, k, m):
     assert _rel_err(kernel.apply_weights(layer, x), expected) < 1e-3
 
 
+@pytest.mark.parametrize("n,k", [(32768, 1280), (5120, 8192)], ids=["wq_b", "wo_b"])
+@pytest.mark.parametrize("m", [255, 256, 300, 1280, 2048, 4103, 8192])
+@torch.inference_mode()
+def test_rocm_mxfp8_linear_gluon_matches_flydsl(flydsl, n, k, m):
+    """The Gluon GEMM, which takes the M it is tuned for on wq_b and wo_b,
+    agrees with AITER's GEMM, and its rows do not depend on M % 256."""
+    from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
+        gluon_gemm_enabled,
+    )
+
+    _require_tuned(n, k)
+    torch.manual_seed(m)
+    layer = _make_block32_layer(n, k, "cuda")
+    kernel = _load(layer, True)
+    scale_rows = layer.weight_scale.view(torch.uint8).repeat_interleave(32, dim=0)
+    assert torch.equal(layer.weight_scale_cols, scale_rows.T)
+
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.5
+    out = kernel.apply_weights(layer, x)
+    expected = rocm_mxfp8_block32_gemm_quant(
+        x, layer.weight, layer.weight_scale, x.dtype, layer.weight_preshuffled
+    )
+    assert _rel_err(out, expected.float()) < 1e-3
+    whole = m // 256 * 256
+    if gluon_gemm_enabled(m, n, k) and gluon_gemm_enabled(whole, n, k):
+        assert torch.equal(out[:whole], kernel.apply_weights(layer, x[:whole]))
+
+
+@torch.inference_mode()
+def test_rocm_mxfp8_linear_gluon_only_tuned_shapes(flydsl):
+    """A FlyDSL layer the Gluon GEMM has no config for keeps no scale copy."""
+    n, k = 1792, 5120
+    _require_tuned(n, k)
+    layer = _make_block32_layer(n, k, "cuda")
+    _load(layer, True)
+    assert layer.weight_preshuffled is not None
+    assert layer.weight_scale_cols is None
+
+
 @pytest.mark.parametrize("m", [1, 72, 4096])
 @torch.inference_mode()
 def test_rocm_mxfp8_wo_a_flydsl_matches_triton(flydsl, m):
