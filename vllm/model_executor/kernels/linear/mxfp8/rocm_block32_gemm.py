@@ -901,13 +901,16 @@ def _preshuffled_gemm(
     x, x_scale, weight_preshuffled, weight_scale, weight_scale_cols, out
 ) -> None:
     """AITER's FlyDSL GEMM, or the Gluon one where it is tuned to be faster."""
-    if weight_scale_cols is not None and x.is_contiguous() and x_scale.is_contiguous():
+    if weight_scale_cols is not None:
         from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
+            gluon_gemm_aligned,
             gluon_gemm_enabled,
             rocm_mxfp8_gluon_gemm,
         )
 
-        if gluon_gemm_enabled(x.shape[0], *weight_preshuffled.shape):
+        if gluon_gemm_enabled(
+            x.shape[0], *weight_preshuffled.shape
+        ) and gluon_gemm_aligned(x, x_scale, weight_preshuffled, weight_scale_cols):
             rocm_mxfp8_gluon_gemm(
                 x, x_scale, weight_preshuffled, weight_scale_cols, out
             )

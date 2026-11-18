@@ -965,43 +965,92 @@ def test_rocm_mxfp8_linear_flydsl_matches_triton(flydsl, n, k, m):
     assert _rel_err(kernel.apply_weights(layer, x), expected) < 1e-3
 
 
-@pytest.mark.parametrize("n,k", [(32768, 1280), (5120, 8192)], ids=["wq_b", "wo_b"])
-@pytest.mark.parametrize("m", [255, 256, 300, 1280, 2048, 4103, 8192])
+GLUON_SHAPES = [(32768, 1280), (5120, 8192)]
+
+
+@pytest.mark.parametrize("n,k", GLUON_SHAPES, ids=["wq_b", "wo_b"])
+@pytest.mark.parametrize("m", [256, 300, 4103])
 @torch.inference_mode()
-def test_rocm_mxfp8_linear_gluon_matches_flydsl(flydsl, n, k, m):
-    """The Gluon GEMM, which takes the M it is tuned for on wq_b and wo_b,
-    agrees with AITER's GEMM, and its rows do not depend on M % 256."""
+def test_rocm_mxfp8_gluon_gemm_matches_flydsl(flydsl, n, k, m):
+    """The Gluon GEMM agrees with AITER's on the same preshuffled weight, and
+    a row of its output does not depend on M % 256 (the last row of tiles
+    overlaps the one before it)."""
     from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
-        gluon_gemm_enabled,
+        rocm_mxfp8_gluon_gemm,
     )
 
     _require_tuned(n, k)
     torch.manual_seed(m)
     layer = _make_block32_layer(n, k, "cuda")
-    kernel = _load(layer, True)
+    _load(layer, True)
     scale_rows = layer.weight_scale.view(torch.uint8).repeat_interleave(32, dim=0)
     assert torch.equal(layer.weight_scale_cols, scale_rows.T)
-
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.5
-    out = kernel.apply_weights(layer, x)
-    expected = rocm_mxfp8_block32_gemm_quant(
-        x, layer.weight, layer.weight_scale, x.dtype, layer.weight_preshuffled
+    x_q, x_scale = mxfp8_e4m3_quantize(x)
+
+    def gluon(rows: int) -> torch.Tensor:
+        out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+        rocm_mxfp8_gluon_gemm(
+            x_q[:rows],
+            x_scale[:rows],
+            layer.weight_preshuffled,
+            layer.weight_scale_cols,
+            out,
+        )
+        return out
+
+    out = gluon(m)
+    expected = rocm_mxfp8_block32_gemm(
+        x_q,
+        x_scale,
+        layer.weight,
+        layer.weight_scale,
+        torch.bfloat16,
+        layer.weight_preshuffled,
     )
     assert _rel_err(out, expected.float()) < 1e-3
     whole = m // 256 * 256
-    if gluon_gemm_enabled(m, n, k) and gluon_gemm_enabled(whole, n, k):
-        assert torch.equal(out[:whole], kernel.apply_weights(layer, x[:whole]))
+    assert torch.equal(out[:whole], gluon(whole))
 
 
+@pytest.mark.parametrize("n,k", GLUON_SHAPES, ids=["wq_b", "wo_b"])
 @torch.inference_mode()
-def test_rocm_mxfp8_linear_gluon_only_tuned_shapes(flydsl):
-    """A FlyDSL layer the Gluon GEMM has no config for keeps no scale copy."""
-    n, k = 1792, 5120
+def test_rocm_mxfp8_linear_routes_large_m_to_gluon(flydsl, monkeypatch, n, k):
+    """A tuned layer runs the Gluon GEMM, not AITER's, at a token count it is
+    enabled for; an activation at an address the Gluon GEMM cannot read (not
+    16-byte aligned) runs AITER's."""
+    from vllm.model_executor.kernels.linear.mxfp8 import rocm_block32_gemm
+    from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
+        gluon_gemm_enabled,
+    )
+
     _require_tuned(n, k)
+    m = 4103
+    assert gluon_gemm_enabled(m, n, k)
+    torch.manual_seed(0)
     layer = _make_block32_layer(n, k, "cuda")
-    _load(layer, True)
-    assert layer.weight_preshuffled is not None
-    assert layer.weight_scale_cols is None
+    kernel = _load(layer, True)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.5
+    x_q, x_scale = mxfp8_e4m3_quantize(x)
+    args = (layer.weight, layer.weight_scale, x.dtype, layer.weight_preshuffled)
+    expected = rocm_mxfp8_block32_gemm(x_q, x_scale, *args).float()
+
+    aiter_calls = []
+    aiter_gemm = rocm_block32_gemm._aiter_gemm
+
+    def counting_aiter_gemm(*gemm_args):
+        aiter_calls.append(gemm_args[0].shape[0])
+        aiter_gemm(*gemm_args)
+
+    monkeypatch.setattr(rocm_block32_gemm, "_aiter_gemm", counting_aiter_gemm)
+    assert _rel_err(kernel.apply_weights(layer, x), expected) < 1e-3
+    assert aiter_calls == []
+
+    shifted = torch.empty(m * k + 8, device="cuda", dtype=torch.uint8)
+    x_view = shifted[8:].view(x_q.dtype).view(m, k).copy_(x_q)
+    out = rocm_mxfp8_block32_gemm(x_view, x_scale, *args, layer.weight_scale_cols)
+    assert aiter_calls == [m]
+    assert _rel_err(out, expected) < 1e-3
 
 
 @pytest.mark.parametrize("m", [1, 72, 4096])

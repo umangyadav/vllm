@@ -1,5 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Portions adapted from ROCm/gfx950-gluon-tutorials
+# (https://github.com/ROCm/gfx950-gluon-tutorials, kernels/gemm/inter_wave/a8w8):
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 AMD ROCm™ Software
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """Gluon MXFP8 GEMM for gfx950 on a (16, 16)-preshuffled weight, large M.
 
 `y = x @ w.T` for the inputs AITER's FlyDSL GEMM takes: an e4m3 activation
@@ -32,6 +55,7 @@ from typing import NamedTuple
 import torch
 
 from vllm.triton_utils import aggregate, gl, gluon, tl
+from vllm.utils.platform_utils import num_compute_units
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
@@ -43,7 +67,8 @@ _NUM_WARPS = 8
 _NUM_CUS = 256
 # A half tile takes this much of a full tile's time.
 _HALF_TILE_COST = 0.62
-_MAX_BYTES = 1 << 31
+# Copies into LDS are 16 bytes wide, which Triton has to prove of the pointers.
+_ALIGN = 16
 
 
 class GluonGemmConfig(NamedTuple):
@@ -56,7 +81,8 @@ class GluonGemmConfig(NamedTuple):
     row_tiles: tuple[int, ...] = ()  # except for these counts
 
 
-# (N, K) -> config, DeepSeek V4.1 dense attention linears at TP=1.
+# (N, K) -> config, DeepSeek V4.1 dense attention linears at TP=1, tuned for
+# the tile rounds of `_NUM_CUS` CUs.
 _TUNED: dict[tuple[int, int], GluonGemmConfig] = {
     (32768, 1280): GluonGemmConfig(True, 8, 6, 16, (1, 2, 4, 5, 6, 8)),  # wq_b
     (5120, 8192): GluonGemmConfig(False, 8, 0, 7),  # wo_b
@@ -248,9 +274,10 @@ def _mxfp8_gluon_tile(
     lay: _Layouts,
     HALF: gl.constexpr,
 ):
-    """Rows `m0..m0 + 256` of a 256-column window at column `n0`: all of it,
-    or with HALF only its right 128 columns (a half tile; its window starts
-    128 columns left of it, inside the matrix as full tiles come first).
+    """Rows `m0..m0 + 256` (`m0` is int64: M * N can pass 2^31) of a
+    256-column window at column `n0`: all of it, or with HALF only its right
+    128 columns (a half tile; its window starts 128 columns left of it,
+    inside the matrix as full tiles come first).
 
     A K-pair (256 K) is 8 MFMA stages on the quadrants tl, bl, tr, br (4 on
     tr, br for a half tile), each followed by a memory stage that reads the
@@ -382,7 +409,7 @@ def _mxfp8_gluon_tile(
         sa_bot = (sa_bot_0, sa_bot_1)
         sb_left = (sb_left_0, sb_left_1)
         sb_right = (sb_right_0, sb_right_1)
-        for j in tl.static_range(2):
+        for j in gl.static_range(2):
             # Only waits may sit between stages: pointers are formed inside.
             if not HALF:
                 async_copy.wait_group(WAIT)
@@ -505,7 +532,7 @@ def _mxfp8_gluon_tile(
     sa_bot = (sa_bot_0, sa_bot_1)
     sb_left = (sb_left_0, sb_left_1)
     sb_right = (sb_right_0, sb_right_1)
-    for j in tl.static_range(2):
+    for j in gl.static_range(2):
         if not HALF:
             acc_tl = cdna4.mfma_scaled(
                 a_top, sa_top[j], "e4m3", b_left, sb_left[j], "e4m3", acc_tl
@@ -549,7 +576,10 @@ def _mxfp8_gluon_tile(
     cdna4.buffer_store(ptr=c_bl + HN, offsets=c_offs, stored_value=acc_br.to(out_ty))
 
 
-@gluon.jit(do_not_specialize=["M", "NM", "NN_FULL", "NN_HALF"])
+@gluon.jit(
+    do_not_specialize=["M", "NM", "NN_FULL", "NN_HALF"],
+    do_not_specialize_on_alignment=["c_ptr"],
+)
 def _mxfp8_gluon_gemm_kernel(
     a_ptr,
     b_ptr,
@@ -589,7 +619,7 @@ def _mxfp8_gluon_gemm_kernel(
             stride_cm,
             a_scale_stride4,
             b_scale_stride4,
-            min(pid_m * BLOCK_M, M - BLOCK_M),
+            min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64),
             pid_n * BLOCK_N,
             lay,
             False,
@@ -606,7 +636,7 @@ def _mxfp8_gluon_gemm_kernel(
             stride_cm,
             a_scale_stride4,
             b_scale_stride4,
-            min(pid_m * BLOCK_M, M - BLOCK_M),
+            min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64),
             NN_FULL * BLOCK_N + (pid_n - 1) * (BLOCK_N // 2),
             lay,
             True,
@@ -626,8 +656,8 @@ def _full_column_tiles(nm: int, nn: int) -> int:
 
 
 def gluon_gemm_config(N: int, K: int) -> GluonGemmConfig | None:
-    """The tuned config of an `(N, K)` weight, or None."""
-    return _TUNED.get((N, K))
+    """The tuned config of an `(N, K)` weight on this GPU, or None."""
+    return _TUNED.get((N, K)) if num_compute_units() == _NUM_CUS else None
 
 
 def gluon_gemm_enabled(M: int, N: int, K: int) -> bool:
@@ -638,6 +668,12 @@ def gluon_gemm_enabled(M: int, N: int, K: int) -> bool:
         return False
     row_tiles = -(-M // BLOCK_M)
     return row_tiles >= cfg.min_row_tiles or row_tiles in cfg.row_tiles
+
+
+def gluon_gemm_aligned(*tensors: torch.Tensor) -> bool:
+    """Whether the kernel can read these tensors: contiguous, and at an
+    address Triton specializes as aligned."""
+    return all(t.is_contiguous() and t.data_ptr() % _ALIGN == 0 for t in tensors)
 
 
 def weight_scale_cols(weight_scale: torch.Tensor, N: int) -> torch.Tensor:
@@ -657,8 +693,9 @@ def rocm_mxfp8_gluon_gemm(
     """`out[...] = x @ weight.T` for a tuned `(N, K)`.
 
     Args:
-        x: [M, K] e4m3 activation, contiguous, M >= 256.
-        x_scale: [M, K / 32] E8M0 (uint8) activation scales, contiguous.
+        x: [M, K] e4m3 activation, M >= 256; with `x_scale` and the weight
+            tensors, `gluon_gemm_aligned`.
+        x_scale: [M, K / 32] E8M0 (uint8) activation scales.
         weight_preshuffled: [N, K] e4m3 weight in AITER's (16, 16) layout.
         weight_scale_cols: [K / 32, N] uint8, see `weight_scale_cols`.
         out: [M, N] bf16 output, contiguous.
@@ -667,36 +704,32 @@ def rocm_mxfp8_gluon_gemm(
     M, K = x.shape
     N = weight_preshuffled.shape[0]
     cfg = _TUNED[(N, K)]
-    assert M >= BLOCK_M and N % BLOCK_N == 0 and K % (2 * BLOCK_K) == 0
+    assert M >= BLOCK_M and N % BLOCK_N == 0
+    assert K % (2 * BLOCK_K) == 0 and K >= 4 * BLOCK_K and N * K < 1 << 31
     assert x_scale.shape == (M, K // 32) and weight_scale_cols.shape == (K // 32, N)
-    assert x.is_contiguous() and x_scale.is_contiguous() and out.is_contiguous()
-    nn = N // BLOCK_N
-    # The kernel addresses each buffer with 32-bit offsets.
-    rows = _MAX_BYTES // max(K, out.element_size() * N) // BLOCK_M * BLOCK_M
-    for start in range(0, M, rows):
-        m0, m1 = min(start, M - BLOCK_M), min(start + rows, M)
-        nm = -(-(m1 - m0) // BLOCK_M)
-        nn_full = _full_column_tiles(nm, nn)
-        nn_half = 2 * (nn - nn_full)
-        _mxfp8_gluon_gemm_kernel[(nm * (nn_full + nn_half),)](
-            x[m0:m1].view(torch.float8_e4m3fn),
-            weight_preshuffled.view(torch.float8_e4m3fn),
-            out[m0:m1],
-            x_scale[m0:m1].view(torch.uint8),
-            weight_scale_cols,
-            m1 - m0,
-            K,
-            N,
-            K // 32 // 4,
-            N // 4,
-            nm,
-            nn_full,
-            nn_half,
-            MFMA32=cfg.mfma32,
-            GROUP_M=cfg.group_m,
-            GROUP_N=cfg.group_n,
-            num_warps=_NUM_WARPS,
-            # Accumulators stay in VGPRs: two waves fit a SIMD without AGPR
-            # copies.
-            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-        )
+    assert gluon_gemm_aligned(x, x_scale, weight_preshuffled, weight_scale_cols)
+    assert out.is_contiguous()
+    nm, nn = -(-M // BLOCK_M), N // BLOCK_N
+    nn_full = _full_column_tiles(nm, nn)
+    nn_half = 2 * (nn - nn_full)
+    _mxfp8_gluon_gemm_kernel[(nm * (nn_full + nn_half),)](
+        x.view(torch.float8_e4m3fn),
+        weight_preshuffled.view(torch.float8_e4m3fn),
+        out,
+        x_scale.view(torch.uint8),
+        weight_scale_cols,
+        M,
+        K,
+        N,
+        K // 32 // 4,
+        N // 4,
+        nm,
+        nn_full,
+        nn_half,
+        MFMA32=cfg.mfma32,
+        GROUP_M=cfg.group_m,
+        GROUP_N=cfg.group_n,
+        num_warps=_NUM_WARPS,
+        # Accumulators stay in VGPRs: two waves fit a SIMD without AGPR copies.
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
