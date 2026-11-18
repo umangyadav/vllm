@@ -285,6 +285,7 @@ def _mxfp8_gluon_tile(
     lay: _Layouts,
     HALF: gl.constexpr,
     A_COLS: gl.constexpr,
+    EARLY_STORE: gl.constexpr,
 ):
     """Rows `m0..m0 + 256` (`m0` is int64: M * N can pass 2^31) of a
     256-column window at column `n0`: all of it, or with HALF only its right
@@ -584,22 +585,30 @@ def _mxfp8_gluon_tile(
             acc_tl = cdna4.mfma_scaled(
                 a_top, sa_top[j], "e4m3", b_left, sb_left[j], "e4m3", acc_tl
             )
+            if EARLY_STORE and j == 1:
+                cdna4.buffer_store(acc_tl.to(out_ty), c_tl, c_offs)
             async_copy.wait_group(5 - 4 * j)
             a_bot = smem_a_bot.index(j).load(lay.dot_a)
             acc_bl = cdna4.mfma_scaled(
                 a_bot, sa_bot[j], "e4m3", b_left, sb_left[j], "e4m3", acc_bl
             )
+            if EARLY_STORE and j == 1:
+                cdna4.buffer_store(acc_bl.to(out_ty), c_bl, c_offs)
             async_copy.wait_group(4 - 4 * j)
             b_right = smem_b_right.index(j).load(lay.dot_b)
             acc_tr = cdna4.mfma_scaled(
                 a_top, sa_top[j], "e4m3", b_right, sb_right[j], "e4m3", acc_tr
             )
+            if EARLY_STORE and j == 1:
+                cdna4.buffer_store(acc_tr.to(out_ty), c_tl + HN, c_offs)
             if j == 0:
                 async_copy.wait_group(3)
                 b_left = smem_b_left.index(1).load(lay.dot_b)
             acc_br = cdna4.mfma_scaled(
                 a_bot, sa_bot[j], "e4m3", b_right, sb_right[j], "e4m3", acc_br
             )
+            if EARLY_STORE and j == 1:
+                cdna4.buffer_store(acc_br.to(out_ty), c_bl + HN, c_offs)
             if j == 0:
                 async_copy.wait_group(2)
                 a_top = smem_a_top.index(1).load(lay.dot_a)
@@ -607,20 +616,29 @@ def _mxfp8_gluon_tile(
             acc_tr = cdna4.mfma_scaled(
                 a_top, sa_top[j], "e4m3", b_right, sb_right[j], "e4m3", acc_tr
             )
+            if EARLY_STORE and j == 1:
+                cdna4.buffer_store(acc_tr.to(out_ty), c_tl + HN, c_offs)
             async_copy.wait_group(2 - 2 * j)
             a_bot = smem_a_bot.index(j).load(lay.dot_a)
             acc_br = cdna4.mfma_scaled(
                 a_bot, sa_bot[j], "e4m3", b_right, sb_right[j], "e4m3", acc_br
             )
+            if EARLY_STORE and j == 1:
+                cdna4.buffer_store(acc_br.to(out_ty), c_bl + HN, c_offs)
             if j == 0:
                 async_copy.wait_group(1)
                 b_right = smem_b_right.index(1).load(lay.dot_b)
                 a_top = smem_a_top.index(1).load(lay.dot_a)
-    if not HALF:
-        cdna4.buffer_store(ptr=c_tl, offsets=c_offs, stored_value=acc_tl.to(out_ty))
-        cdna4.buffer_store(ptr=c_bl, offsets=c_offs, stored_value=acc_bl.to(out_ty))
-    cdna4.buffer_store(ptr=c_tl + HN, offsets=c_offs, stored_value=acc_tr.to(out_ty))
-    cdna4.buffer_store(ptr=c_bl + HN, offsets=c_offs, stored_value=acc_br.to(out_ty))
+    if not EARLY_STORE:
+        if not HALF:
+            cdna4.buffer_store(ptr=c_tl, offsets=c_offs, stored_value=acc_tl.to(out_ty))
+            cdna4.buffer_store(ptr=c_bl, offsets=c_offs, stored_value=acc_bl.to(out_ty))
+        cdna4.buffer_store(
+            ptr=c_tl + HN, offsets=c_offs, stored_value=acc_tr.to(out_ty)
+        )
+        cdna4.buffer_store(
+            ptr=c_bl + HN, offsets=c_offs, stored_value=acc_br.to(out_ty)
+        )
 
 
 @gluon.jit(
@@ -641,6 +659,7 @@ def _mxfp8_gluon_gemm_kernel(
     NN_FULL,
     NN_HALF,
     MFMA32: gl.constexpr,
+    FIXED_K: gl.constexpr,
     GROUP_M: gl.constexpr,
     GROUP_N: gl.constexpr,
     A_COLS: gl.constexpr,
@@ -662,7 +681,7 @@ def _mxfp8_gluon_gemm_kernel(
             c_ptr,
             a_scale_ptr,
             b_scale_ptr,
-            K,
+            FIXED_K if FIXED_K else K,
             stride_cm,
             a_scale_stride4,
             b_scale_stride4,
@@ -671,6 +690,7 @@ def _mxfp8_gluon_gemm_kernel(
             lay,
             False,
             A_COLS,
+            MFMA32 and A_COLS,
         )
     else:
         pid_m, pid_n = _tile_pids(pid - NM * NN_FULL, NM, NN_HALF, GROUP_M, GROUP_N)
@@ -681,7 +701,7 @@ def _mxfp8_gluon_gemm_kernel(
             c_ptr,
             a_scale_ptr,
             b_scale_ptr,
-            K,
+            FIXED_K if FIXED_K else K,
             stride_cm,
             a_scale_stride4,
             b_scale_stride4,
@@ -690,6 +710,7 @@ def _mxfp8_gluon_gemm_kernel(
             lay,
             True,
             A_COLS,
+            MFMA32 and A_COLS,
         )
 
 
@@ -787,6 +808,7 @@ def rocm_mxfp8_gluon_gemm(
         nn_full,
         nn_half,
         MFMA32=cfg.mfma32,
+        FIXED_K=K if (N, K) == (5120, 8192) else 0,
         GROUP_M=cfg.group_m,
         GROUP_N=cfg.group_n,
         A_COLS=x_scale_cols,
