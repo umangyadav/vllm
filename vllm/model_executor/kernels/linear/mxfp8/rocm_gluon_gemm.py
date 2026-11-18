@@ -82,10 +82,11 @@ class GluonGemmConfig(NamedTuple):
 
 
 # (N, K) -> config, DeepSeek V4.1 dense attention linears at TP=1, tuned for
-# the tile rounds of `_NUM_CUS` CUs.
+# the tile rounds of `_NUM_CUS` CUs with
+# benchmarks/kernels/benchmark_rocm_mxfp8_gluon_gemm.py (cold weights).
 _TUNED: dict[tuple[int, int], GluonGemmConfig] = {
-    (32768, 1280): GluonGemmConfig(True, 8, 6, 16, (1, 2, 4, 5, 6, 8)),  # wq_b
-    (5120, 8192): GluonGemmConfig(False, 8, 0, 7),  # wo_b
+    (32768, 1280): GluonGemmConfig(True, 8, 6, 6, (4,)),  # wq_b
+    (5120, 8192): GluonGemmConfig(False, 8, 0, 13),  # wo_b
 }
 
 
