@@ -200,6 +200,7 @@ def _mxfp8_e4m3_quantize_triton(
     M, K = x.shape
     x = x.contiguous()
     rows = M if scale_cols_rows is None else scale_cols_rows
+    assert rows >= M
     scale_shape = (rows, K // MXFP8_BLOCK_SIZE)
     if scale_cols_rows is not None:
         scale_shape = scale_shape[::-1]

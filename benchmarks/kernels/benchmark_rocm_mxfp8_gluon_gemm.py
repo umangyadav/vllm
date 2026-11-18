@@ -5,11 +5,12 @@
 Both read the same (16, 16)-preshuffled weights. Each timing is a HIP graph
 replay over rotating weights (> 400 MiB, so they are read cold) timed with
 device events; the variants alternate order over `--repeats`, and a row
-reports their medians and the largest spread. Outputs are compared before
-timing.
+reports their medians and the largest spread. Before timing, each Gluon
+variant must reproduce FlyDSL's output in a buffer filled with NaN.
 
 Kernel columns take a quantized activation: `flydsl`, `rows` (Gluon,
-row-major activation scales) and `cols` (Gluon, transposed scales). The `op`
+row-major activation scales; whole tiles of 256 rows only, else nan) and
+`cols` (Gluon, transposed scales, rows padded to whole tiles). The `op`
 columns time `rocm_mxfp8_block32_gemm_quant` on a bf16 activation, quantizer
 included, without and with the Gluon route.
 
@@ -124,21 +125,25 @@ def main():
                     for w, scale, cols in weights
                 ],
             }
+            if m % 256:
+                del variants["rows"]
             variants["flydsl"][0]()
             expected = out[:m].float()
             max_diff = 0.0
-            for name in ("rows", "cols"):
-                variants[name][0]()
-                diff = (out[:m].float() - expected).abs().max().item()
-                max_diff = max(max_diff, diff)
-            diff = (variants["op_gluon"][0]().float() - expected).abs().max().item()
-            max_diff = max(max_diff, diff)
+            for name in set(variants) & {"rows", "cols", "op_gluon"}:
+                out.fill_(float("nan"))
+                result = variants[name][0]()
+                diff = (out[:m] if result is None else result).float() - expected
+                if not diff.norm() < 1e-3 * expected.norm():
+                    raise RuntimeError(f"{name} disagrees with flydsl at M={m}")
+                max_diff = max(max_diff, diff.abs().max().item())
             times: dict[str, list[float]] = {name: [] for name in variants}
             for repeat in range(args.repeats):
                 order = list(variants.items())
                 for name, calls in order if repeat % 2 == 0 else order[::-1]:
                     times[name].append(time_graph_us(calls))
             t = {name: statistics.median(v) for name, v in times.items()}
+            t.setdefault("rows", math.nan)
             spread = max((max(v) - min(v)) / t[name] for name, v in times.items())
             enabled = rocm_gluon_gemm.gluon_gemm_enabled
             print(

@@ -973,9 +973,9 @@ GLUON_IDS = ["wq_b", "wo_b", "wqa"]
 @pytest.mark.parametrize("m", [256, 300, 4103])
 @torch.inference_mode()
 def test_rocm_mxfp8_gluon_gemm_matches_flydsl(flydsl, n, k, m):
-    """The Gluon GEMM agrees with AITER's on the same preshuffled weight. A
-    row of its output depends neither on M % 256 (the last row of tiles
-    overlaps the one before it) nor on the layout of the activation scales."""
+    """The Gluon GEMM agrees with AITER's on the same preshuffled weight,
+    bit for bit across the two layouts of the activation scales, and stores
+    every row (outputs start as NaN)."""
     from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
         rocm_mxfp8_gluon_gemm,
     )
@@ -989,18 +989,6 @@ def test_rocm_mxfp8_gluon_gemm_matches_flydsl(flydsl, n, k, m):
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.5
     x_q, x_scale = mxfp8_e4m3_quantize(x)
 
-    def gluon(rows: int) -> torch.Tensor:
-        out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
-        rocm_mxfp8_gluon_gemm(
-            x_q[:rows],
-            x_scale[:rows],
-            layer.weight_preshuffled,
-            layer.weight_scale_cols,
-            out,
-        )
-        return out
-
-    out = gluon(m)
     expected = rocm_mxfp8_block32_gemm(
         x_q,
         x_scale,
@@ -1009,15 +997,24 @@ def test_rocm_mxfp8_gluon_gemm_matches_flydsl(flydsl, n, k, m):
         torch.bfloat16,
         layer.weight_preshuffled,
     )
-    assert _rel_err(out, expected.float()) < 1e-3
     whole = m // 256 * 256
-    assert torch.equal(out[:whole], gluon(whole))
+    out = torch.full((whole, n), torch.nan, device="cuda", dtype=torch.bfloat16)
+    rocm_mxfp8_gluon_gemm(
+        x_q[:whole],
+        x_scale[:whole],
+        layer.weight_preshuffled,
+        layer.weight_scale_cols,
+        out,
+    )
+    assert _rel_err(out, expected[:whole].float()) < 1e-3
 
-    rows = whole + 256
+    rows = -(-m // 256) * 256
+    with pytest.raises(AssertionError):
+        _mxfp8_e4m3_quantize_triton(x, m - 1)
     x_qp, x_scale_cols = _mxfp8_e4m3_quantize_triton(x, rows)
     assert torch.equal(x_qp[:m], x_q)
     assert torch.equal(x_scale_cols[:, :m], x_scale.T)
-    out_cols = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+    out_cols = torch.full((rows, n), torch.nan, device="cuda", dtype=torch.bfloat16)
     rocm_mxfp8_gluon_gemm(
         x_qp,
         x_scale_cols,
@@ -1026,7 +1023,8 @@ def test_rocm_mxfp8_gluon_gemm_matches_flydsl(flydsl, n, k, m):
         out_cols,
         x_scale_cols=True,
     )
-    assert torch.equal(out_cols[:m], out)
+    assert torch.equal(out_cols[:whole], out)
+    assert _rel_err(out_cols[:m], expected.float()) < 1e-3
 
 
 @pytest.mark.parametrize("n,k", GLUON_SHAPES, ids=GLUON_IDS)
@@ -1034,8 +1032,9 @@ def test_rocm_mxfp8_gluon_gemm_matches_flydsl(flydsl, n, k, m):
 def test_rocm_mxfp8_linear_routes_large_m_to_gluon(flydsl, monkeypatch, n, k):
     """A tuned layer runs the Gluon GEMM, not AITER's, at a token count it is
     enabled for, on a bf16 activation (quantized with transposed scales) and
-    on a quantized one; an activation at an address the Gluon GEMM cannot
-    read (not 16-byte aligned) runs AITER's."""
+    on a quantized one of whole tiles; a quantized activation with a partial
+    tile of rows, or at an address the Gluon GEMM cannot read (not 16-byte
+    aligned), runs AITER's."""
     from vllm.model_executor.kernels.linear.mxfp8 import rocm_block32_gemm
     from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
         gluon_gemm_enabled,
@@ -1064,17 +1063,28 @@ def test_rocm_mxfp8_linear_routes_large_m_to_gluon(flydsl, monkeypatch, n, k):
     assert out.shape == (m, n) and _rel_err(out, expected) < 1e-3
     assert aiter_calls == []
 
-    quantized_routed = gluon_gemm_enabled(m, n, k)
-    out_q = rocm_mxfp8_block32_gemm(x_q, x_scale, *args, layer.weight_scale_cols)
-    assert aiter_calls == ([] if quantized_routed else [m])
-    assert torch.equal(out_q, out) or not quantized_routed
+    whole = m // 256 * 256
+    quantized_routed = gluon_gemm_enabled(whole, n, k)
+    out_q = rocm_mxfp8_block32_gemm(
+        x_q[:whole], x_scale[:whole], *args, layer.weight_scale_cols
+    )
+    assert aiter_calls == ([] if quantized_routed else [whole])
+    assert torch.equal(out_q, out[:whole]) or not quantized_routed
 
     aiter_calls.clear()
-    shifted = torch.empty(m * k + 8, device="cuda", dtype=torch.uint8)
-    x_view = shifted[8:].view(x_q.dtype).view(m, k).copy_(x_q)
-    out = rocm_mxfp8_block32_gemm(x_view, x_scale, *args, layer.weight_scale_cols)
+    assert not gluon_gemm_enabled(m, n, k)
+    out_q = rocm_mxfp8_block32_gemm(x_q, x_scale, *args, layer.weight_scale_cols)
     assert aiter_calls == [m]
-    assert _rel_err(out, expected) < 1e-3
+    assert _rel_err(out_q, expected) < 1e-3
+
+    aiter_calls.clear()
+    shifted = torch.empty(whole * k + 8, device="cuda", dtype=torch.uint8)
+    x_view = shifted[8:].view(x_q.dtype).view(whole, k).copy_(x_q[:whole])
+    out = rocm_mxfp8_block32_gemm(
+        x_view, x_scale[:whole], *args, layer.weight_scale_cols
+    )
+    assert aiter_calls == [whole]
+    assert _rel_err(out, expected[:whole]) < 1e-3
 
 
 @pytest.mark.parametrize("m", [1, 72, 4096])

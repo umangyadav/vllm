@@ -624,7 +624,7 @@ def _mxfp8_gluon_tile(
 
 
 @gluon.jit(
-    do_not_specialize=["M", "NM", "NN_FULL", "NN_HALF"],
+    do_not_specialize=["NM", "NN_FULL", "NN_HALF"],
     do_not_specialize_on_alignment=["c_ptr"],
 )
 def _mxfp8_gluon_gemm_kernel(
@@ -633,7 +633,6 @@ def _mxfp8_gluon_gemm_kernel(
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
-    M,
     K,
     stride_cm,
     a_scale_stride4,
@@ -648,9 +647,8 @@ def _mxfp8_gluon_gemm_kernel(
 ):
     """Programs [0, NM * NN_FULL) take the full tiles of the first
     NN_FULL * 256 columns, the rest the half tiles of the NN_HALF * 128
-    columns after them. The last row of tiles ends at row M, overlapping the
-    one before it when M % 256 != 0 (both store the same values). Scale
-    strides are / 4, so that copy offsets stay provably dword aligned."""
+    columns after them. Scale strides are / 4, so that copy offsets stay
+    provably dword aligned."""
     BLOCK_M: gl.constexpr = 256
     BLOCK_N: gl.constexpr = 256
     lay = _Layouts(MFMA32)
@@ -658,8 +656,6 @@ def _mxfp8_gluon_gemm_kernel(
     if pid < NM * NN_FULL:
         pid_m, pid_n = _tile_pids(pid, NM, NN_FULL, GROUP_M, GROUP_N)
         m0 = (pid_m * BLOCK_M).to(gl.int64)
-        if not A_COLS:
-            m0 = min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64)
         _mxfp8_gluon_tile(
             a_ptr,
             b_ptr,
@@ -679,8 +675,6 @@ def _mxfp8_gluon_gemm_kernel(
     else:
         pid_m, pid_n = _tile_pids(pid - NM * NN_FULL, NM, NN_HALF, GROUP_M, GROUP_N)
         m0 = (pid_m * BLOCK_M).to(gl.int64)
-        if not A_COLS:
-            m0 = min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64)
         _mxfp8_gluon_tile(
             a_ptr,
             b_ptr,
@@ -719,9 +713,10 @@ def gluon_gemm_config(N: int, K: int) -> GluonGemmConfig | None:
 def gluon_gemm_enabled(M: int, N: int, K: int, scale_cols: bool = False) -> bool:
     """Whether `rocm_mxfp8_gluon_gemm` is the faster GEMM for an `[M, K]`
     activation on an `[N, K]` weight (else AITER's), given the layout of the
-    activation scales."""
+    activation scales. Row-major scales need whole tiles of rows; transposed
+    ones come padded to them."""
     cfg = gluon_gemm_config(N, K)
-    if cfg is None or M < BLOCK_M:
+    if cfg is None or M < BLOCK_M or (M % BLOCK_M and not scale_cols):
         return False
     row_tiles = -(-M // BLOCK_M)
     least, extra = cfg[5:] if scale_cols else cfg[3:5]
@@ -738,7 +733,7 @@ def weight_scale_cols(weight_scale: torch.Tensor, N: int) -> torch.Tensor:
     """`[N / g, K / 32]` E8M0 weight scales (g = 1 or 32) as the
     `[K / 32, N]` uint8 tensor `rocm_mxfp8_gluon_gemm` reads."""
     scale = weight_scale.view(torch.uint8)
-    return scale.repeat_interleave(N // scale.shape[0], dim=0).T.contiguous()
+    return scale.T.repeat_interleave(N // scale.shape[0], dim=1)
 
 
 def rocm_mxfp8_gluon_gemm(
@@ -752,30 +747,30 @@ def rocm_mxfp8_gluon_gemm(
     """`out[...] = x @ weight.T` for a tuned `(N, K)`.
 
     Args:
-        x: [M, K] e4m3 activation, M >= 256; with `x_scale` and the weight
-            tensors, `gluon_gemm_aligned`.
+        x: [M, K] e4m3 activation, M a multiple of 256; with `x_scale` and
+            the weight tensors, `gluon_gemm_aligned`.
         x_scale: [M, K / 32] E8M0 (uint8) activation scales, or with
             `x_scale_cols` [K / 32, M].
         weight_preshuffled: [N, K] e4m3 weight in AITER's (16, 16) layout.
         weight_scale_cols: [K / 32, N] uint8, see `weight_scale_cols`.
         out: [M, N] bf16 output, contiguous.
         x_scale_cols: `x_scale` is transposed, which the kernel reads with a
-            tenth of the cache lines; M must then be a multiple of 256.
+            tenth of the cache lines.
 
     """
     M, K = x.shape
     N = weight_preshuffled.shape[0]
     cfg = _TUNED[(N, K)]
-    assert M >= BLOCK_M and N % BLOCK_N == 0
+    assert M >= BLOCK_M and M % BLOCK_M == 0 and N % BLOCK_N == 0
     assert K % (2 * BLOCK_K) == 0 and K >= 4 * BLOCK_K and N * K < 1 << 31
     if x_scale_cols:
-        assert M % BLOCK_M == 0 and x_scale.shape == (K // 32, M)
+        assert x_scale.shape == (K // 32, M)
     else:
         assert x_scale.shape == (M, K // 32)
     assert weight_scale_cols.shape == (K // 32, N)
     assert gluon_gemm_aligned(x, x_scale, weight_preshuffled, weight_scale_cols)
     assert out.is_contiguous()
-    nm, nn = -(-M // BLOCK_M), N // BLOCK_N
+    nm, nn = M // BLOCK_M, N // BLOCK_N
     nn_full = _full_column_tiles(nm, nn)
     nn_half = 2 * (nn - nn_full)
     _mxfp8_gluon_gemm_kernel[(nm * (nn_full + nn_half),)](
@@ -784,7 +779,6 @@ def rocm_mxfp8_gluon_gemm(
         out,
         x_scale.view(torch.uint8),
         weight_scale_cols,
-        M,
         K,
         N,
         (M if x_scale_cols else K // 32) // 4,
