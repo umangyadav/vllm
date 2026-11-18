@@ -183,8 +183,14 @@ _MXFP8_QUANT_KERNEL = None
 
 def _mxfp8_e4m3_quantize_triton(
     x: torch.Tensor,
+    scale_cols_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused 2D MXFP8 quant (non-swizzled, row-major [M, K//32] scales)."""
+    """Fused 2D MXFP8 quant (non-swizzled, row-major [M, K//32] scales).
+
+    With `scale_cols_rows` (>= M) the scales are transposed and both outputs
+    padded to that many rows, `[rows, K]` and `[K // 32, rows]`; the padding
+    is left uninitialized.
+    """
     from vllm.triton_utils import triton
 
     global _MXFP8_QUANT_KERNEL
@@ -193,10 +199,15 @@ def _mxfp8_e4m3_quantize_triton(
 
     M, K = x.shape
     x = x.contiguous()
-    xq = torch.empty((M, K), dtype=MXFP8_VALUE_DTYPE, device=x.device)
-    scales = torch.empty(
-        (M, K // MXFP8_BLOCK_SIZE), dtype=MXFP8_SCALE_DTYPE, device=x.device
-    )
+    rows = M if scale_cols_rows is None else scale_cols_rows
+    scale_shape = (rows, K // MXFP8_BLOCK_SIZE)
+    if scale_cols_rows is not None:
+        scale_shape = scale_shape[::-1]
+    xq = torch.empty((rows, K), dtype=MXFP8_VALUE_DTYPE, device=x.device)
+    scales = torch.empty(scale_shape, dtype=MXFP8_SCALE_DTYPE, device=x.device)
+    scale_strides = scales.stride()
+    if scale_cols_rows is not None:
+        scale_strides = scale_strides[::-1]
     BLOCK_M, BLOCK_K = (1 if M == 1 else 4), 512
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
     _MXFP8_QUANT_KERNEL[grid](
@@ -209,8 +220,7 @@ def _mxfp8_e4m3_quantize_triton(
         x.stride(1),
         xq.stride(0),
         xq.stride(1),
-        scales.stride(0),
-        scales.stride(1),
+        *scale_strides,
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         FP8_MAX=float(torch.finfo(MXFP8_VALUE_DTYPE).max),

@@ -4,9 +4,14 @@
 
 Both read the same (16, 16)-preshuffled weights. Each timing is a HIP graph
 replay over rotating weights (> 400 MiB, so they are read cold) timed with
-device events; the two GEMMs alternate order over `--repeats`, and a row
-reports the median and the spread of the repeats. Outputs are compared
-before timing.
+device events; the variants alternate order over `--repeats`, and a row
+reports their medians and the largest spread. Outputs are compared before
+timing.
+
+Kernel columns take a quantized activation: `flydsl`, `rows` (Gluon,
+row-major activation scales) and `cols` (Gluon, transposed scales). The `op`
+columns time `rocm_mxfp8_block32_gemm_quant` on a bf16 activation, quantizer
+included, without and with the Gluon route.
 
 Example (record the commit):
     git rev-parse HEAD
@@ -24,7 +29,13 @@ import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.kernels.linear.mxfp8 import rocm_gluon_gemm
-from vllm.model_executor.kernels.linear.mxfp8.rocm_block32_gemm import _aiter_gemm
+from vllm.model_executor.kernels.linear.mxfp8.rocm_block32_gemm import (
+    _aiter_gemm,
+    rocm_mxfp8_block32_gemm_quant,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    _mxfp8_e4m3_quantize_triton,
+)
 
 COLD_BYTES = 400 * 1024**2
 INNER = 2
@@ -64,13 +75,16 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(0)
-    fp8 = torch.float8_e4m3fn
+    bf16 = torch.bfloat16
     print(torch.cuda.get_device_name(0))
-    print("N K M flydsl_us gluon_us gluon/flydsl spread tflops routed max_diff")
+    print(
+        "N K M flydsl rows cols rows/flydsl cols/flydsl op_flydsl op_gluon "
+        "op_ratio spread routed_rows routed_cols max_diff"
+    )
     for n, k in rocm_gluon_gemm._TUNED:
         weights = []
         for _ in range(math.ceil(COLD_BYTES / (n * k))):
-            weight = (torch.randn(n, k, device="cuda") * 2).to(fp8)
+            weight = (torch.randn(n, k, device="cuda") * 2).to(torch.float8_e4m3fn)
             scale = torch.randint(
                 120, 130, (n // 32, k // 32), device="cuda", dtype=torch.uint8
             )
@@ -82,39 +96,57 @@ def main():
                 )
             )
         for m in args.m:
-            x = (torch.randn(m, k, device="cuda") * 2).to(fp8)
-            x_scale = torch.randint(
-                120, 130, (m, k // 32), device="cuda", dtype=torch.uint8
-            )
-            out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-            gluon = [
-                partial(rocm_gluon_gemm.rocm_mxfp8_gluon_gemm, x, x_scale, w, cols, out)
-                for w, _, cols in weights
-            ]
-            flydsl = [
-                partial(_aiter_gemm, x, x_scale, w, scale, out)
-                for w, scale, _ in weights
-            ]
+            x = torch.randn(m, k, device="cuda", dtype=bf16)
+            x_q, x_scale = _mxfp8_e4m3_quantize_triton(x)
+            rows = -(-m // 256) * 256
+            x_qp, x_scale_cols = _mxfp8_e4m3_quantize_triton(x, rows)
+            out = torch.empty(rows, n, device="cuda", dtype=bf16)
+            gluon = rocm_gluon_gemm.rocm_mxfp8_gluon_gemm
+            variants = {
+                "flydsl": [
+                    partial(_aiter_gemm, x_q, x_scale, w, scale, out[:m])
+                    for w, scale, _ in weights
+                ],
+                "rows": [
+                    partial(gluon, x_q, x_scale, w, cols, out[:m])
+                    for w, _, cols in weights
+                ],
+                "cols": [
+                    partial(gluon, x_qp, x_scale_cols, w, cols, out, True)
+                    for w, _, cols in weights
+                ],
+                "op_flydsl": [
+                    partial(rocm_mxfp8_block32_gemm_quant, x, w, scale, bf16, w)
+                    for w, scale, _ in weights
+                ],
+                "op_gluon": [
+                    partial(rocm_mxfp8_block32_gemm_quant, x, w, scale, bf16, w, cols)
+                    for w, scale, cols in weights
+                ],
+            }
+            variants["flydsl"][0]()
+            expected = out[:m].float()
             max_diff = 0.0
-            for gluon_call, flydsl_call in zip(gluon, flydsl):
-                flydsl_call()
-                expected = out.float()
-                gluon_call()
-                max_diff = max(max_diff, (out.float() - expected).abs().max().item())
-            times: dict[str, list[float]] = {"flydsl": [], "gluon": []}
+            for name in ("rows", "cols"):
+                variants[name][0]()
+                diff = (out[:m].float() - expected).abs().max().item()
+                max_diff = max(max_diff, diff)
+            diff = (variants["op_gluon"][0]().float() - expected).abs().max().item()
+            max_diff = max(max_diff, diff)
+            times: dict[str, list[float]] = {name: [] for name in variants}
             for repeat in range(args.repeats):
-                order = [("flydsl", flydsl), ("gluon", gluon)]
+                order = list(variants.items())
                 for name, calls in order if repeat % 2 == 0 else order[::-1]:
                     times[name].append(time_graph_us(calls))
-            t_fly = statistics.median(times["flydsl"])
-            t_gluon = statistics.median(times["gluon"])
-            spread = max(
-                (max(t) - min(t)) / statistics.median(t) for t in times.values()
-            )
+            t = {name: statistics.median(v) for name, v in times.items()}
+            spread = max((max(v) - min(v)) / t[name] for name, v in times.items())
+            enabled = rocm_gluon_gemm.gluon_gemm_enabled
             print(
-                f"{n} {k} {m} {t_fly:.1f} {t_gluon:.1f} {t_gluon / t_fly:.3f} "
-                f"{spread:.1%} {2 * m * n * k / t_gluon / 1e6:.0f} "
-                f"{rocm_gluon_gemm.gluon_gemm_enabled(m, n, k)} {max_diff:.3g}",
+                f"{n} {k} {m} {t['flydsl']:.1f} {t['rows']:.1f} {t['cols']:.1f} "
+                f"{t['rows'] / t['flydsl']:.3f} {t['cols'] / t['flydsl']:.3f} "
+                f"{t['op_flydsl']:.1f} {t['op_gluon']:.1f} "
+                f"{t['op_gluon'] / t['op_flydsl']:.3f} {spread:.1%} "
+                f"{enabled(m, n, k)} {enabled(m, n, k, True)} {max_diff:.3g}",
                 flush=True,
             )
         del weights

@@ -28,7 +28,8 @@
 `y = x @ w.T` for the inputs AITER's FlyDSL GEMM takes: an e4m3 activation
 with row-major E8M0 scales `[M, K / 32]` and an e4m3 weight in AITER's
 `(16, 16)` preshuffled layout. The weight scale is read expanded per row and
-transposed, `[K / 32, N]` (`weight_scale_cols`).
+transposed, `[K / 32, N]` (`weight_scale_cols`); the activation scale can be
+given transposed too, which is cheaper to read.
 
 A workgroup is 8 warps on a 256 x 256 tile cut into 2 x 2 quadrants, with
 four double-buffered LDS operand buffers and a warp pipeline that keeps one
@@ -36,8 +37,9 @@ MFMA stream per SIMD, as in ROCm/gfx950-gluon-tutorials
 `kernels/gemm/inter_wave/a8w8`. What the rest of the time depends on:
 
 * scales sit in LDS with the rows of one K group adjacent, so an MFMA scale
-  operand is one transposed 64-bit LDS read. The activation scale goes to an
-  LDS staging buffer as it is and is moved there a K-pair later;
+  operand is one transposed 64-bit LDS read. A transposed scale is copied
+  there directly; a row-major activation scale (a cache line per row and
+  K-pair) goes to an LDS staging buffer and is moved a K-pair later;
 * the result is stored from a non-transposed MFMA layout (a lane holds
   consecutive rows), so a store touches few rows: 4 with 16x16x128, or 2
   whole cache lines with 32x32x64, which wins when K is short;
@@ -72,21 +74,29 @@ _ALIGN = 16
 
 
 class GluonGemmConfig(NamedTuple):
-    """Tuned launch parameters of one `(N, K)`."""
+    """Tuned launch parameters of one `(N, K)`.
+
+    AITER's GEMM is the faster one below `min_row_tiles` rows of tiles, except
+    for the counts in `row_tiles`; None never runs the Gluon GEMM. `cols_*`
+    are the same for transposed activation scales.
+    """
 
     mfma32: bool  # 32x32x64 MFMA instead of 16x16x128
     group_m: int  # activation tiles an XCD keeps in L2 (when group_n == 0)
     group_n: int  # weight tiles an XCD keeps in L2 instead, or 0
-    min_row_tiles: int  # AITER's GEMM is faster for fewer rows of tiles,
-    row_tiles: tuple[int, ...] = ()  # except for these counts
+    min_row_tiles: int | None
+    row_tiles: tuple[int, ...]
+    cols_min_row_tiles: int | None
+    cols_row_tiles: tuple[int, ...]
 
 
 # (N, K) -> config, DeepSeek V4.1 dense attention linears at TP=1, tuned for
 # the tile rounds of `_NUM_CUS` CUs with
 # benchmarks/kernels/benchmark_rocm_mxfp8_gluon_gemm.py (cold weights).
 _TUNED: dict[tuple[int, int], GluonGemmConfig] = {
-    (32768, 1280): GluonGemmConfig(True, 8, 6, 6, (4,)),  # wq_b
-    (5120, 8192): GluonGemmConfig(False, 8, 0, 13),  # wo_b
+    (32768, 1280): GluonGemmConfig(True, 8, 6, 8, (4, 6), 8, (4, 6)),  # wq_b
+    (5120, 8192): GluonGemmConfig(False, 8, 0, 13, (), 7, ()),  # wo_b
+    (1792, 5120): GluonGemmConfig(False, 8, 0, None, (), 17, ()),  # wq_a | wkv
 }
 
 
@@ -274,6 +284,7 @@ def _mxfp8_gluon_tile(
     n0,
     lay: _Layouts,
     HALF: gl.constexpr,
+    A_COLS: gl.constexpr,
 ):
     """Rows `m0..m0 + 256` (`m0` is int64: M * N can pass 2^31) of a
     256-column window at column `n0`: all of it, or with HALF only its right
@@ -302,7 +313,11 @@ def _mxfp8_gluon_tile(
     smem_b_left = smem_b_right
     if not HALF:
         smem_b_left = gl.allocate_shared_memory(f8, [2, BLOCK_K, HN], lay.shared_b)
-    smem_stage = gl.allocate_shared_memory(u8, [2, BLOCK_M, 2 * NG], lay.scale_stage)
+    smem_stage = smem_a_top
+    if not A_COLS:
+        smem_stage = gl.allocate_shared_memory(
+            u8, [2, BLOCK_M, 2 * NG], lay.scale_stage
+        )
     smem_sa = gl.allocate_shared_memory(u8, [2, BLOCK_M, 2 * NG], lay.scale_shared)
     smem_sb = gl.allocate_shared_memory(u8, [2, BLOCK_N, 2 * NG], lay.scale_shared)
 
@@ -329,11 +344,18 @@ def _mxfp8_gluon_tile(
     SB_K = b_scale_stride4 * 4
     sb_offs = offs_sn[:, None] + offs_skb[None, :] * SB_K
     sb_tile = b_scale_ptr + n0
-    offs_ska = gl.arange(0, 2 * NG, gl.SliceLayout(0, lay.scale_rows))
-    offs_sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, lay.scale_rows))
-    SA_ROW = a_scale_stride4 * 4
-    sa_offs = offs_sm[:, None] * SA_ROW + offs_ska[None, :]
-    sa_tile = a_scale_ptr + m0 * SA_ROW
+    SA = a_scale_stride4 * 4
+    if A_COLS:
+        offs_sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, lay.scale_fill))
+        sa_offs = offs_sm[:, None] + offs_skb[None, :] * SA
+        sa_tile = a_scale_ptr + m0
+        SA_PAIR = 2 * NG * SA
+    else:
+        offs_ska = gl.arange(0, 2 * NG, gl.SliceLayout(0, lay.scale_rows))
+        offs_sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, lay.scale_rows))
+        sa_offs = offs_sm[:, None] * SA + offs_ska[None, :]
+        sa_tile = a_scale_ptr + m0 * SA
+        SA_PAIR = 2 * NG
 
     acc_tl = gl.zeros((HM, HN), gl.float32, lay.mfma)
     acc_bl = gl.zeros((HM, HN), gl.float32, lay.mfma)
@@ -349,8 +371,14 @@ def _mxfp8_gluon_tile(
     else:
         async_copy.buffer_load_to_shared(smem_b_right.index(0), b_base + B_HALF, b_offs)
         async_copy.buffer_load_to_shared(smem_a_top.index(0), a_base, a_offs)
-    async_copy.buffer_load_to_shared(smem_stage.index(0), sa_tile, sa_offs)
-    async_copy.buffer_load_to_shared(smem_stage.index(1), sa_tile + 2 * NG, sa_offs)
+    if A_COLS:
+        async_copy.buffer_load_to_shared(smem_sa.index(0), sa_tile, sa_offs)
+        async_copy.buffer_load_to_shared(smem_sa.index(1), sa_tile + SA_PAIR, sa_offs)
+    else:
+        async_copy.buffer_load_to_shared(smem_stage.index(0), sa_tile, sa_offs)
+        async_copy.buffer_load_to_shared(
+            smem_stage.index(1), sa_tile + SA_PAIR, sa_offs
+        )
     async_copy.buffer_load_to_shared(smem_sb.index(0), sb_tile, sb_offs)
     async_copy.buffer_load_to_shared(smem_sb.index(1), sb_tile + 2 * NG * SB_K, sb_offs)
     async_copy.commit_group()
@@ -392,8 +420,10 @@ def _mxfp8_gluon_tile(
     b_right = b_left
     a_top = smem_a_top.index(0).load(lay.dot_a)
     a_bot = a_top
-    rows = smem_stage.index(0).load(lay.scale_quad)
-    smem_sa.index(0).store(rows)
+    rows = gl.zeros([BLOCK_M, 2 * NG], u8, lay.scale_quad)
+    if not A_COLS:
+        rows = smem_stage.index(0).load(lay.scale_quad)
+        smem_sa.index(0).store(rows)
     sa_top_0, sa_top_1, sa_bot_0, sa_bot_1 = _split_halves(
         smem_sa.index(0).load(lay.scale_a_pair), lay.scale_a
     )
@@ -440,12 +470,19 @@ def _mxfp8_gluon_tile(
                             sb_tile + 8 * min(q + 2, last) * SB_K,
                             sb_offs,
                         )
-                        async_copy.buffer_load_to_shared(
-                            smem_stage.index(q % 2),
-                            sa_tile + 8 * min(q + 2, last),
-                            sa_offs,
-                        )
-                    else:
+                        if A_COLS:
+                            async_copy.buffer_load_to_shared(
+                                smem_sa.index(q % 2),
+                                sa_tile + min(q + 2, last) * SA_PAIR,
+                                sa_offs,
+                            )
+                        else:
+                            async_copy.buffer_load_to_shared(
+                                smem_stage.index(q % 2),
+                                sa_tile + min(q + 2, last) * SA_PAIR,
+                                sa_offs,
+                            )
+                    elif not A_COLS:
                         smem_sa.index(nb).store(rows)
                     async_copy.commit_group()
             async_copy.wait_group(WAIT)
@@ -460,7 +497,8 @@ def _mxfp8_gluon_tile(
                         smem_a_bot.index(j), a_base + A_HALF + j * BLOCK_K, a_offs
                     )
                     if j == 0:
-                        rows = smem_stage.index(nb).load(lay.scale_quad)
+                        if not A_COLS:
+                            rows = smem_stage.index(nb).load(lay.scale_quad)
                     else:
                         sa_top_0, sa_top_1, sa_bot_0, sa_bot_1 = _split_halves(
                             smem_sa.index(nb).load(lay.scale_a_pair), lay.scale_a
@@ -483,12 +521,19 @@ def _mxfp8_gluon_tile(
                             sb_tile + 8 * min(q + 2, last) * SB_K,
                             sb_offs,
                         )
-                        async_copy.buffer_load_to_shared(
-                            smem_stage.index(q % 2),
-                            sa_tile + 8 * min(q + 2, last),
-                            sa_offs,
-                        )
-                    else:
+                        if A_COLS:
+                            async_copy.buffer_load_to_shared(
+                                smem_sa.index(q % 2),
+                                sa_tile + min(q + 2, last) * SA_PAIR,
+                                sa_offs,
+                            )
+                        else:
+                            async_copy.buffer_load_to_shared(
+                                smem_stage.index(q % 2),
+                                sa_tile + min(q + 2, last) * SA_PAIR,
+                                sa_offs,
+                            )
+                    elif not A_COLS:
                         smem_sa.index(nb).store(rows)
                 async_copy.commit_group()
             async_copy.wait_group(WAIT)
@@ -508,7 +553,8 @@ def _mxfp8_gluon_tile(
                         smem_a_bot.index(j), a_base + A_HALF + j * BLOCK_K, a_offs
                     )
                     if j == 0:
-                        rows = smem_stage.index(nb).load(lay.scale_quad)
+                        if not A_COLS:
+                            rows = smem_stage.index(nb).load(lay.scale_quad)
                     else:
                         sa_top_0, sa_top_1, sa_bot_0, sa_bot_1 = _split_halves(
                             smem_sa.index(nb).load(lay.scale_a_pair), lay.scale_a
@@ -598,6 +644,7 @@ def _mxfp8_gluon_gemm_kernel(
     MFMA32: gl.constexpr,
     GROUP_M: gl.constexpr,
     GROUP_N: gl.constexpr,
+    A_COLS: gl.constexpr,
 ):
     """Programs [0, NM * NN_FULL) take the full tiles of the first
     NN_FULL * 256 columns, the rest the half tiles of the NN_HALF * 128
@@ -610,6 +657,9 @@ def _mxfp8_gluon_gemm_kernel(
     pid = gl.program_id(axis=0)
     if pid < NM * NN_FULL:
         pid_m, pid_n = _tile_pids(pid, NM, NN_FULL, GROUP_M, GROUP_N)
+        m0 = (pid_m * BLOCK_M).to(gl.int64)
+        if not A_COLS:
+            m0 = min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64)
         _mxfp8_gluon_tile(
             a_ptr,
             b_ptr,
@@ -620,13 +670,17 @@ def _mxfp8_gluon_gemm_kernel(
             stride_cm,
             a_scale_stride4,
             b_scale_stride4,
-            min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64),
+            m0,
             pid_n * BLOCK_N,
             lay,
             False,
+            A_COLS,
         )
     else:
         pid_m, pid_n = _tile_pids(pid - NM * NN_FULL, NM, NN_HALF, GROUP_M, GROUP_N)
+        m0 = (pid_m * BLOCK_M).to(gl.int64)
+        if not A_COLS:
+            m0 = min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64)
         _mxfp8_gluon_tile(
             a_ptr,
             b_ptr,
@@ -637,10 +691,11 @@ def _mxfp8_gluon_gemm_kernel(
             stride_cm,
             a_scale_stride4,
             b_scale_stride4,
-            min(pid_m * BLOCK_M, M - BLOCK_M).to(gl.int64),
+            m0,
             NN_FULL * BLOCK_N + (pid_n - 1) * (BLOCK_N // 2),
             lay,
             True,
+            A_COLS,
         )
 
 
@@ -661,14 +716,16 @@ def gluon_gemm_config(N: int, K: int) -> GluonGemmConfig | None:
     return _TUNED.get((N, K)) if num_compute_units() == _NUM_CUS else None
 
 
-def gluon_gemm_enabled(M: int, N: int, K: int) -> bool:
+def gluon_gemm_enabled(M: int, N: int, K: int, scale_cols: bool = False) -> bool:
     """Whether `rocm_mxfp8_gluon_gemm` is the faster GEMM for an `[M, K]`
-    activation on an `[N, K]` weight (else AITER's)."""
+    activation on an `[N, K]` weight (else AITER's), given the layout of the
+    activation scales."""
     cfg = gluon_gemm_config(N, K)
     if cfg is None or M < BLOCK_M:
         return False
     row_tiles = -(-M // BLOCK_M)
-    return row_tiles >= cfg.min_row_tiles or row_tiles in cfg.row_tiles
+    least, extra = cfg[5:] if scale_cols else cfg[3:5]
+    return least is not None and (row_tiles >= least or row_tiles in extra)
 
 
 def gluon_gemm_aligned(*tensors: torch.Tensor) -> bool:
@@ -690,16 +747,20 @@ def rocm_mxfp8_gluon_gemm(
     weight_preshuffled: torch.Tensor,
     weight_scale_cols: torch.Tensor,
     out: torch.Tensor,
+    x_scale_cols: bool = False,
 ) -> None:
     """`out[...] = x @ weight.T` for a tuned `(N, K)`.
 
     Args:
         x: [M, K] e4m3 activation, M >= 256; with `x_scale` and the weight
             tensors, `gluon_gemm_aligned`.
-        x_scale: [M, K / 32] E8M0 (uint8) activation scales.
+        x_scale: [M, K / 32] E8M0 (uint8) activation scales, or with
+            `x_scale_cols` [K / 32, M].
         weight_preshuffled: [N, K] e4m3 weight in AITER's (16, 16) layout.
         weight_scale_cols: [K / 32, N] uint8, see `weight_scale_cols`.
         out: [M, N] bf16 output, contiguous.
+        x_scale_cols: `x_scale` is transposed, which the kernel reads with a
+            tenth of the cache lines; M must then be a multiple of 256.
 
     """
     M, K = x.shape
@@ -707,7 +768,11 @@ def rocm_mxfp8_gluon_gemm(
     cfg = _TUNED[(N, K)]
     assert M >= BLOCK_M and N % BLOCK_N == 0
     assert K % (2 * BLOCK_K) == 0 and K >= 4 * BLOCK_K and N * K < 1 << 31
-    assert x_scale.shape == (M, K // 32) and weight_scale_cols.shape == (K // 32, N)
+    if x_scale_cols:
+        assert M % BLOCK_M == 0 and x_scale.shape == (K // 32, M)
+    else:
+        assert x_scale.shape == (M, K // 32)
+    assert weight_scale_cols.shape == (K // 32, N)
     assert gluon_gemm_aligned(x, x_scale, weight_preshuffled, weight_scale_cols)
     assert out.is_contiguous()
     nm, nn = -(-M // BLOCK_M), N // BLOCK_N
@@ -722,7 +787,7 @@ def rocm_mxfp8_gluon_gemm(
         M,
         K,
         N,
-        K // 32 // 4,
+        (M if x_scale_cols else K // 32) // 4,
         N // 4,
         nm,
         nn_full,
@@ -730,6 +795,7 @@ def rocm_mxfp8_gluon_gemm(
         MFMA32=cfg.mfma32,
         GROUP_M=cfg.group_m,
         GROUP_N=cfg.group_n,
+        A_COLS=x_scale_cols,
         num_warps=_NUM_WARPS,
         # Accumulators stay in VGPRs: two waves fit a SIMD without AGPR copies.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),

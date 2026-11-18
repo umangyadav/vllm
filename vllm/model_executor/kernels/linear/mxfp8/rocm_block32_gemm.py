@@ -52,6 +52,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    _mxfp8_e4m3_quantize_triton,
     mxfp8_e4m3_quantize,
 )
 from vllm.triton_utils import tl, triton
@@ -901,7 +902,7 @@ def _preshuffled_gemm(
     x, x_scale, weight_preshuffled, weight_scale, weight_scale_cols, out
 ) -> None:
     """AITER's FlyDSL GEMM, or the Gluon one where it is tuned to be faster."""
-    if weight_scale_cols is not None:
+    if weight_scale_cols is not None and out.dtype == torch.bfloat16:
         from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
             gluon_gemm_aligned,
             gluon_gemm_enabled,
@@ -916,6 +917,36 @@ def _preshuffled_gemm(
             )
             return
     _aiter_gemm(x, x_scale, weight_preshuffled, weight_scale, out)
+
+
+def _gluon_quant_gemm(
+    x, weight_preshuffled, weight_scale_cols, out_dtype
+) -> torch.Tensor | None:
+    """Quantizes `x` with transposed scales for the Gluon GEMM, which reads
+    them with fewer cache lines; None where AITER's GEMM is the faster one.
+    Rows are padded to whole tiles, so the result is a view."""
+    from vllm.model_executor.kernels.linear.mxfp8.rocm_gluon_gemm import (
+        BLOCK_M,
+        gluon_gemm_aligned,
+        gluon_gemm_enabled,
+        rocm_mxfp8_gluon_gemm,
+    )
+
+    M = x.shape[0]
+    N, K = weight_preshuffled.shape
+    if not (
+        out_dtype == torch.bfloat16
+        and gluon_gemm_enabled(M, N, K, scale_cols=True)
+        and gluon_gemm_aligned(weight_preshuffled, weight_scale_cols)
+    ):
+        return None
+    rows = -(-M // BLOCK_M) * BLOCK_M
+    x_q, x_scale = _mxfp8_e4m3_quantize_triton(x, rows)
+    out = torch.empty((rows, N), dtype=out_dtype, device=x.device)
+    rocm_mxfp8_gluon_gemm(
+        x_q, x_scale, weight_preshuffled, weight_scale_cols, out, x_scale_cols=True
+    )
+    return out[:M]
 
 
 def _rocm_mxfp8_block32_gemm_impl(
@@ -1032,6 +1063,12 @@ def _rocm_mxfp8_block32_gemm_quant_impl(
     opaque op so a compiled caller cannot freeze the token-count decision.
     """
     M, K = x.shape
+    if weight_preshuffled is not None and weight_scale_cols is not None:
+        gluon_out = _gluon_quant_gemm(
+            x, weight_preshuffled, weight_scale_cols, out_dtype
+        )
+        if gluon_out is not None:
+            return gluon_out
     out = torch.empty((M, weight.shape[0]), dtype=out_dtype, device=x.device)
     if M <= 0:
         return out
